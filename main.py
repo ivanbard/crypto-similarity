@@ -1,4 +1,5 @@
 import os, requests
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,4 +11,9 @@ headers = {"x-cg-demo-api-key": CG_KEY}
 # print(f"{CG_KEY}")
 
 response = requests.get(url, headers=headers)
-print(response.json())
+data = response.json()
+
+df = pd.DataFrame(data)
+print(df)
+df.to_csv('crypto.csv', index=False)
+#save to csv, so i have a proper dataset to work with rather than json bs

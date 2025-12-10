@@ -29,6 +29,20 @@ def fetch_coingecko(pages=3):
         time.sleep(1) 
     return pd.DataFrame(all_data)
 
+def fetch_messari(asset_slug):
+    all_data = []
+    headers = {"x-messarir-api-key": MESSARI_KEY} if MESSARI_KEY else {}
+    url = f"https://data.messari.io/api/v1/assets/{asset_slug}/metrics"
+
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json().get("data", {})
+        market = data.get("market_data", {})
+        roi = data.get("roi_data", {})
+
+    return pd.DataFrame(all_data)
+
 def main():
     df=fetch_coingecko()
     #df = pd.DataFrame(all_data)

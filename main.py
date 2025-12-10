@@ -103,11 +103,11 @@ def fetch_messari_prof(asset_slug):
     return None
 
 def collect_all_data(num_coins=100):
-    print("collecting coingecko market data")
+    print("collecting coingecko market data\n")
     market_df = fetch_coingecko(pages=3)
     coin_ids = market_df["id"].head(num_coins).tolist()
 
-    print("collecting coingecko coin details")
+    print("collecting coingecko coin details\n")
     cg_details = []
     for i, coin_id in enumerate(coin_ids):
         detail = fetch_coingecko_details(coin_id)
@@ -118,8 +118,37 @@ def collect_all_data(num_coins=100):
     
     cg_details_df = pd.DataFrame(cg_details)
 
-    
+    print("collecting messari profiles\n")
+    messari_profiles = []
+    for i, coin_id in enumerate(coin_ids):
+        profile = fetch_messari_prof(coin_id)
+        if profile:
+            messari_profiles.append(profile)
+            print(f"  [{i+1}/{len(coin_ids)}] {coin_id}")
+        time.sleep(0.5)
 
+    messari_profiles_df = pd.DataFrame(messari_profiles)
+
+    print("collecting messari metrics\n")
+    messari_metrics = []
+    for i, coin_id in enumerate(coin_ids):
+        metrics = fetch_messari(coin_id)
+        if metrics:
+            messari_metrics.append(metrics)
+            print(f"  [{i+1}/{len(coin_ids)}] {coin_id}")
+        time.sleep(0.5)
+
+    messari_metrics_df = pd.DataFrame(messari_metrics)
+
+    print("merging datasets\n")
+    final_df = market_df[["id", "symbol", "name", "current_price", "market_cap", 
+                          "total_volume", "price_change_percentage_24h"]].copy()
+    
+    final_df = final_df.merge(cg_details_df, on="id", how="left")
+    final_df = final_df.merge(messari_profiles_df, on="id", how="left")
+    final_df = final_df.merge(messari_metrics_df, on="id", how="left", suffixes=("", "_messari"))
+    
+    return final_df
 
 def main():
     collect_all_data()

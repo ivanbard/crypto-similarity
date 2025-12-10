@@ -29,10 +29,11 @@ def fetch_coingecko(pages=3):
         time.sleep(1) 
     return pd.DataFrame(all_data)
 
+def main():
+    df=fetch_coingecko()
+    #df = pd.DataFrame(all_data)
+    print(df)
+    #save to csv, so i have a proper dataset to work with rather than json bs
 
-
-#for page in range(1,3):
-
-#df = pd.DataFrame(all_data)
-#print(df)
-#save to csv, so i have a proper dataset to work with rather than json bs
+if __name__ == "__main__":
+    main()

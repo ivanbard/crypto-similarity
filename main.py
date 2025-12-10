@@ -102,11 +102,27 @@ def fetch_messari_prof(asset_slug):
         }
     return None
 
+def collect_all_data(num_coins=100):
+    print("collecting coingecko market data")
+    market_df = fetch_coingecko(pages=3)
+    coin_ids = market_df["id"].head(num_coins).tolist()
+
+    print("collecting coingecko coin details")
+    cg_details = []
+    for i, coin_id in enumerate(coin_ids):
+        detail = fetch_coingecko_details(coin_id)
+        if detail:
+            cg_details.append(detail)
+            print(f"  [{i+1}/{len(coin_ids)}] {coin_id}")
+        time.sleep(1.5)
+    
+    cg_details_df = pd.DataFrame(cg_details)
+
+    
+
+
 def main():
-    df=fetch_coingecko()
-    #df = pd.DataFrame(all_data)
-    print(df)
-    #save to csv, so i have a proper dataset to work with rather than json bs
+    collect_all_data()
 
 if __name__ == "__main__":
     main()

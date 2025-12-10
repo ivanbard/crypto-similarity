@@ -29,6 +29,27 @@ def fetch_coingecko(pages=3):
         time.sleep(1) 
     return pd.DataFrame(all_data)
 
+def fetch_coingecko_details(coin_id):
+    headers = {"x-cg-demo-api-key": CG_KEY}
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+    
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        return {
+            "id": coin_id,
+            "categories": data.get("categories", []),
+            "hashing_algorithm": data.get("hashing_algorithm"),
+            "genesis_date": data.get("genesis_date"),
+            "sentiment_up": data.get("sentiment_votes_up_percentage"),
+            "sentiment_down": data.get("sentiment_votes_down_percentage"),
+            "developer_score": data.get("developer_score"),
+            "community_score": data.get("community_score"),
+            "liquidity_score": data.get("liquidity_score"),
+        }
+    return None
+
 def fetch_messari(asset_slug):
     #all_data = []
     headers = {"x-messarir-api-key": MESSARI_KEY} if MESSARI_KEY else {}

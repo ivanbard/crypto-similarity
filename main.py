@@ -30,7 +30,7 @@ def fetch_coingecko(pages=3):
     return pd.DataFrame(all_data)
 
 def fetch_messari(asset_slug):
-    all_data = []
+    #all_data = []
     headers = {"x-messarir-api-key": MESSARI_KEY} if MESSARI_KEY else {}
     url = f"https://data.messari.io/api/v1/assets/{asset_slug}/metrics"
 
@@ -41,7 +41,45 @@ def fetch_messari(asset_slug):
         market = data.get("market_data", {})
         roi = data.get("roi_data", {})
 
-    return pd.DataFrame(all_data)
+        return {
+            "id": asset_slug,
+            "price_usd": market.get("price_usd"),
+            "volume_24h": market.get("volume_last_24_hours"),
+            "volatility_30d": market.get("volatility_last_30_days"),
+            "percent_change_24h": market.get("percent_change_usd_last_24_hours"),
+            "percent_change_7d": roi.get("percent_change_last_1_week"),
+            "percent_change_30d": roi.get("percent_change_last_1_month"),
+            "percent_change_90d": roi.get("percent_change_last_3_months"),
+        }
+
+    return None #if status != 200
+
+def fetch_messari_prof(asset_slug):
+    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
+    url = f"https://data.messari.io/api/v1/assets/{asset_slug}/profile"
+    
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json().get("data", {})
+        profile = data.get("profile")
+
+        general = profile.get("general", {})
+        tech = profile.get("technology", {})
+        econ = profile.get("economics", {})
+
+        return {
+            "id": asset_slug,
+            "sector": general.get("overview", {}).get("sector"),
+            "category": general.get("overview", {}).get("category"),
+            "tag_line": general.get("overview", {}).get("tagline"),
+            "token_type": general.get("overview", {}).get("token_type"),
+            "consensus_mechanism": tech.get("overview", {}).get("consensus_mechanism"),
+            "block_time": tech.get("overview", {}).get("block_time_interval"),
+            "launch_style": econ.get("launch", {}).get("launch_style"),
+            "initial_distribution": econ.get("launch", {}).get("initial_distribution"),
+        }
+    return None
 
 def main():
     df=fetch_coingecko()

@@ -52,7 +52,7 @@ def fetch_coingecko_details(coin_id):
 
 def fetch_messari(asset_slug):
     #all_data = []
-    headers = {"x-messarir-api-key": MESSARI_KEY} if MESSARI_KEY else {}
+    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}  # Fixed typo: was "x-messarir-api-key"
     url = f"https://data.messari.io/api/v1/assets/{asset_slug}/metrics"
 
     response = requests.get(url, headers=headers)
@@ -144,14 +144,34 @@ def collect_all_data(num_coins=100):
     final_df = market_df[["id", "symbol", "name", "current_price", "market_cap", 
                           "total_volume", "price_change_percentage_24h"]].copy()
     
-    final_df = final_df.merge(cg_details_df, on="id", how="left")
-    final_df = final_df.merge(messari_profiles_df, on="id", how="left")
-    final_df = final_df.merge(messari_metrics_df, on="id", how="left", suffixes=("", "_messari"))
+    # only merge if dfs are non empty and have 'id' col.
+    if not cg_details_df.empty and "id" in cg_details_df.columns:
+        final_df = final_df.merge(cg_details_df, on="id", how="left")
+    
+    if not messari_profiles_df.empty and "id" in messari_profiles_df.columns:
+        final_df = final_df.merge(messari_profiles_df, on="id", how="left")
+    else:
+        print("Warning: No Messari profile data collected")
+    
+    if not messari_metrics_df.empty and "id" in messari_metrics_df.columns:
+        final_df = final_df.merge(messari_metrics_df, on="id", how="left", suffixes=("", "_messari"))
+    else:
+        print("Warning: No Messari metrics data collected")
     
     return final_df
 
 def main():
-    collect_all_data()
+    df = collect_all_data(num_coins=100)
+    
+    #make dirs
+    os.makedirs("data/raw", exist_ok=True)
+    df.to_csv("data/raw/crypto_features_raw.csv", index=False)
+    print(f"\nSaved {len(df)} coins to data/raw/crypto_features_raw.csv")
+    
+    print("\nColumns collected:")
+    print(df.columns.tolist())
+    print("\nSample data:")
+    print(df.head())
 
 if __name__ == "__main__":
     main()

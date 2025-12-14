@@ -52,11 +52,14 @@ def fetch_coingecko_details(coin_id):
 
 def fetch_messari(asset_slug):
     #all_data = []
-    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}  # Fixed typo: was "x-messarir-api-key"
+    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
     url = f"https://data.messari.io/api/v1/assets/{asset_slug}/metrics"
 
     response = requests.get(url, headers=headers)
 
+    if response.status_code != 200:
+        print(f"messari metrics error for {asset_slug}: {response.status_code}")
+    
     if response.status_code == 200:
         data = response.json().get("data", {})
         market = data.get("market_data", {})
@@ -80,6 +83,9 @@ def fetch_messari_prof(asset_slug):
     url = f"https://data.messari.io/api/v1/assets/{asset_slug}/profile"
     
     response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        print(f"messari profile error for {asset_slug}: {response.status_code}")
 
     if response.status_code == 200:
         data = response.json().get("data", {})

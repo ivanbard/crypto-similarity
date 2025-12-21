@@ -9,6 +9,54 @@ MESSARI_KEY = os.getenv("MESSARI-KEY")
 
 url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page=250&page={}"
 
+# mapping from CoinGecko IDs to Messari slugs (Messari uses different naming)
+CG_TO_MESSARI = {
+    "binancecoin": "binance-coin",
+    "avalanche-2": "avalanche",
+    "hedera-hashgraph": "hedera",
+    "crypto-com-chain": "crypto-com-coin",
+    "the-open-network": "toncoin",
+    "staked-ether": "lido-staked-ether",
+    "wrapped-bitcoin": "wrapped-bitcoin",
+    "shiba-inu": "shiba-inu",
+}
+
+def get_messari_assets():
+    """Fetch list of all Messari assets to build a lookup map"""
+    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
+    url = "https://data.messari.io/api/v2/assets?limit=500"
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json().get("data", [])
+        #create mappings: symbol -> slug and name_slug -> slug
+        asset_map = {}
+        for asset in data:
+            slug = asset.get("slug", "").lower()
+            symbol = asset.get("symbol", "").lower()
+            name = asset.get("name", "").lower().replace(" ", "-")
+            if symbol:
+                asset_map[symbol] = slug
+            if name:
+                asset_map[name] = slug
+            if slug:
+                asset_map[slug] = slug
+        return asset_map
+    else:
+        print(f"Failed to fetch Messari asset list: {response.status_code}")
+        return {}
+
+def get_messari_slug(coin_id, symbol, messari_assets):
+    if coin_id in CG_TO_MESSARI:
+        return CG_TO_MESSARI[coin_id]
+    
+    if coin_id.lower() in messari_assets:
+        return messari_assets[coin_id.lower()]
+    
+    if symbol.lower() in messari_assets:
+        return messari_assets[symbol.lower()]
+    
+    return coin_id
 
 def fetch_coingecko(pages=3):
     headers = {"x-cg-demo-api-key": CG_KEY}
@@ -50,23 +98,20 @@ def fetch_coingecko_details(coin_id):
         }
     return None
 
-def fetch_messari(asset_slug):
-    #all_data = []
+def fetch_messari(messari_slug, original_id):
+    """Fetch Messari metrics. Returns data with original CoinGecko ID for merging."""
     headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
-    url = f"https://data.messari.io/api/v1/assets/{asset_slug}/metrics"
+    url = f"https://data.messari.io/api/v2/assets/{messari_slug}/metrics"
 
     response = requests.get(url, headers=headers)
 
-    if response.status_code != 200:
-        print(f"messari metrics error for {asset_slug}: {response.status_code}")
-    
     if response.status_code == 200:
         data = response.json().get("data", {})
         market = data.get("market_data", {})
         roi = data.get("roi_data", {})
 
         return {
-            "id": asset_slug,
+            "id": original_id,  # Use CoinGecko ID for merging
             "price_usd": market.get("price_usd"),
             "volume_24h": market.get("volume_last_24_hours"),
             "volatility_30d": market.get("volatility_last_30_days"),
@@ -75,28 +120,29 @@ def fetch_messari(asset_slug):
             "percent_change_30d": roi.get("percent_change_last_1_month"),
             "percent_change_90d": roi.get("percent_change_last_3_months"),
         }
+    
+    # Only log non-404 errors (404 just means asset not in Messari)
+    if response.status_code != 404:
+        print(f"  messari metrics error for {messari_slug}: {response.status_code}")
+    return None
 
-    return None #if status != 200
-
-def fetch_messari_prof(asset_slug):
+def fetch_messari_prof(messari_slug, original_id):
+    """Fetch Messari profile. Returns data with original CoinGecko ID for merging."""
     headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
-    url = f"https://data.messari.io/api/v1/assets/{asset_slug}/profile"
+    url = f"https://data.messari.io/api/v2/assets/{messari_slug}/profile"
     
     response = requests.get(url, headers=headers)
 
-    if response.status_code != 200:
-        print(f"messari profile error for {asset_slug}: {response.status_code}")
-
     if response.status_code == 200:
         data = response.json().get("data", {})
-        profile = data.get("profile")
+        profile = data.get("profile") or {}
 
-        general = profile.get("general", {})
-        tech = profile.get("technology", {})
-        econ = profile.get("economics", {})
+        general = profile.get("general", {}) or {}
+        tech = profile.get("technology", {}) or {}
+        econ = profile.get("economics", {}) or {}
 
         return {
-            "id": asset_slug,
+            "id": original_id,  # Use CoinGecko ID for merging
             "sector": general.get("overview", {}).get("sector"),
             "category": general.get("overview", {}).get("category"),
             "tag_line": general.get("overview", {}).get("tagline"),
@@ -106,6 +152,10 @@ def fetch_messari_prof(asset_slug):
             "launch_style": econ.get("launch", {}).get("launch_style"),
             "initial_distribution": econ.get("launch", {}).get("initial_distribution"),
         }
+    
+    # Only log non-404 errors (404 just means asset not in Messari)
+    if response.status_code != 404:
+        print(f"  messari profile error for {messari_slug}: {response.status_code}")
     return None
 
 def collect_all_data(num_coins=100):
@@ -124,27 +174,45 @@ def collect_all_data(num_coins=100):
     
     cg_details_df = pd.DataFrame(cg_details)
 
-    print("collecting messari profiles\n")
-    messari_profiles = []
-    for i, coin_id in enumerate(coin_ids):
-        profile = fetch_messari_prof(coin_id)
-        if profile:
-            messari_profiles.append(profile)
-            print(f"  [{i+1}/{len(coin_ids)}] {coin_id}")
-        time.sleep(0.5)
+    # Messari API requires authentication - skip if no API key
+    messari_profiles_df = pd.DataFrame()
+    messari_metrics_df = pd.DataFrame()
+    
+    if MESSARI_KEY:
+        # Build mapping of CoinGecko IDs to Messari slugs
+        print("fetching Messari asset list for ID mapping...\n")
+        messari_assets = get_messari_assets()
+        
+        # Create lookup with symbols from market_df
+        coin_symbols = dict(zip(market_df["id"], market_df["symbol"]))
+        
+        print("collecting messari profiles\n")
+        messari_profiles = []
+        for i, coin_id in enumerate(coin_ids):
+            symbol = coin_symbols.get(coin_id, "")
+            messari_slug = get_messari_slug(coin_id, symbol, messari_assets)
+            profile = fetch_messari_prof(messari_slug, coin_id)
+            if profile:
+                messari_profiles.append(profile)
+                print(f"  [{i+1}/{len(coin_ids)}] {coin_id} -> {messari_slug}")
+            time.sleep(0.3)
+        messari_profiles_df = pd.DataFrame(messari_profiles)
+        print(f"  collected {len(messari_profiles)} profiles\n")
 
-    messari_profiles_df = pd.DataFrame(messari_profiles)
-
-    print("collecting messari metrics\n")
-    messari_metrics = []
-    for i, coin_id in enumerate(coin_ids):
-        metrics = fetch_messari(coin_id)
-        if metrics:
-            messari_metrics.append(metrics)
-            print(f"  [{i+1}/{len(coin_ids)}] {coin_id}")
-        time.sleep(0.5)
-
-    messari_metrics_df = pd.DataFrame(messari_metrics)
+        print("collecting messari metrics\n")
+        messari_metrics = []
+        for i, coin_id in enumerate(coin_ids):
+            symbol = coin_symbols.get(coin_id, "")
+            messari_slug = get_messari_slug(coin_id, symbol, messari_assets)
+            metrics = fetch_messari(messari_slug, coin_id)
+            if metrics:
+                messari_metrics.append(metrics)
+                print(f"  [{i+1}/{len(coin_ids)}] {coin_id} -> {messari_slug}")
+            time.sleep(0.3)
+        messari_metrics_df = pd.DataFrame(messari_metrics)
+        print(f"  collected {len(messari_metrics)} metrics\n")
+    else:
+        print("Skipping Messari API (no API key configured)\n")
 
     print("merging datasets\n")
     final_df = market_df[["id", "symbol", "name", "current_price", "market_cap", 

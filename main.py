@@ -5,58 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 CG_KEY = os.getenv("COINGECKO-KEY")
-MESSARI_KEY = os.getenv("MESSARI-KEY")
 
-url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&per_page=250&page={}"
+# Note: Messari API now requires Enterprise subscription (paid)
+# All free endpoints have been removed. Using CoinGecko only.
 
-# mapping from CoinGecko IDs to Messari slugs (Messari uses different naming)
-CG_TO_MESSARI = {
-    "binancecoin": "binance-coin",
-    "avalanche-2": "avalanche",
-    "hedera-hashgraph": "hedera",
-    "crypto-com-chain": "crypto-com-coin",
-    "the-open-network": "toncoin",
-    "staked-ether": "lido-staked-ether",
-    "wrapped-bitcoin": "wrapped-bitcoin",
-    "shiba-inu": "shiba-inu",
-}
-
-def get_messari_assets():
-    """Fetch list of all Messari assets to build a lookup map"""
-    headers = {"x-messari-api-key": MESSARI_KEY} if MESSARI_KEY else {}
-    url = "https://data.messari.io/api/v2/assets?limit=500"
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        data = response.json().get("data", [])
-        #create mappings: symbol -> slug and name_slug -> slug
-        asset_map = {}
-        for asset in data:
-            slug = asset.get("slug", "").lower()
-            symbol = asset.get("symbol", "").lower()
-            name = asset.get("name", "").lower().replace(" ", "-")
-            if symbol:
-                asset_map[symbol] = slug
-            if name:
-                asset_map[name] = slug
-            if slug:
-                asset_map[slug] = slug
-        return asset_map
-    else:
-        print(f"Failed to fetch Messari asset list: {response.status_code}")
-        return {}
-
-def get_messari_slug(coin_id, symbol, messari_assets):
-    if coin_id in CG_TO_MESSARI:
-        return CG_TO_MESSARI[coin_id]
-    
-    if coin_id.lower() in messari_assets:
-        return messari_assets[coin_id.lower()]
-    
-    if symbol.lower() in messari_assets:
-        return messari_assets[symbol.lower()]
-    
-    return coin_id
 
 def fetch_coingecko(pages=3):
     headers = {"x-cg-demo-api-key": CG_KEY}

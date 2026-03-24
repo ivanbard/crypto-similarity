@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 dashboard/
 data/processed/
+data/history/
 /node_modules

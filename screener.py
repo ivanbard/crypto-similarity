@@ -6,7 +6,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,8 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_KEY") or os.getenv("COINGECKO-KEY")
 RAW_OUTPUT_PATH = Path("data/raw/crypto_features_raw.csv")
 PROCESSED_OUTPUT_PATH = Path("data/processed/screener.json")
 HTML_OUTPUT_PATH = Path("dashboard/index.html")
+SNAPSHOT_OUTPUT_DIR = Path("data/history/snapshots")
+VALIDATION_OUTPUT_DIR = Path("data/history/reports")
 
 BUNDLE_RULES = [
     {
@@ -489,6 +491,247 @@ def build_screener_payload(raw_df: pd.DataFrame, config: FilterConfig | None = N
         },
         "bundles": bundles,
     }
+
+
+def build_snapshot_frame(
+    raw_df: pd.DataFrame,
+    config: FilterConfig | None = None,
+    snapshot_date: date | None = None,
+) -> pd.DataFrame:
+    active_config = config or FilterConfig()
+    snapshot_day = snapshot_date or date.today()
+    prepared_df = prepare_asset_frame(raw_df, active_config)
+    bundle_payload = build_bundle_payload(prepared_df, active_config)
+    bundle_df = expand_bundle_memberships(prepared_df)
+    eligible_df = bundle_df[bundle_df["passes_basic_filters"]].copy()
+
+    columns = [
+        "snapshot_date",
+        "asset_id",
+        "symbol",
+        "name",
+        "bundle_id",
+        "bundle_label",
+        "is_candidate",
+        "rank",
+        "gap_ratio",
+        "current_price",
+        "market_cap",
+        "total_volume",
+    ]
+    if eligible_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    candidate_lookup: dict[tuple[str, str], dict[str, float | int]] = {}
+    for bundle in bundle_payload:
+        for rank, candidate in enumerate(bundle["candidates"], start=1):
+            candidate_lookup[(bundle["id"], candidate["id"])] = {
+                "rank": rank,
+                "gap_ratio": candidate["gap_ratio"],
+            }
+
+    snapshot_rows: list[dict[str, Any]] = []
+    for row in eligible_df.itertuples(index=False):
+        candidate_meta = candidate_lookup.get((row.bundle_id, row.asset_id), {})
+        snapshot_rows.append(
+            {
+                "snapshot_date": snapshot_day.isoformat(),
+                "asset_id": row.asset_id,
+                "symbol": row.symbol,
+                "name": row.name,
+                "bundle_id": row.bundle_id,
+                "bundle_label": row.bundle_label,
+                "is_candidate": (row.bundle_id, row.asset_id) in candidate_lookup,
+                "rank": candidate_meta.get("rank"),
+                "gap_ratio": candidate_meta.get("gap_ratio"),
+                "current_price": row.current_price,
+                "market_cap": row.market_cap,
+                "total_volume": row.total_volume,
+            }
+        )
+
+    snapshot_df = pd.DataFrame(snapshot_rows, columns=columns)
+    if not snapshot_df.empty:
+        snapshot_df["rank"] = snapshot_df["rank"].astype("Int64")
+    return snapshot_df.sort_values(["bundle_label", "rank", "market_cap"], ascending=[True, True, False], na_position="last").reset_index(drop=True)
+
+
+def save_snapshot_frame(
+    snapshot_df: pd.DataFrame,
+    output_dir: Path = SNAPSHOT_OUTPUT_DIR,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_value = snapshot_df["snapshot_date"].iloc[0] if not snapshot_df.empty else date.today().isoformat()
+    output_path = output_dir / f"{snapshot_value}.csv"
+    snapshot_df.to_csv(output_path, index=False)
+    return output_path
+
+
+def load_snapshot_history(snapshot_dir: Path = SNAPSHOT_OUTPUT_DIR) -> pd.DataFrame:
+    snapshot_files = sorted(snapshot_dir.glob("*.csv"))
+    if not snapshot_files:
+        return pd.DataFrame(
+            columns=[
+                "snapshot_date",
+                "asset_id",
+                "symbol",
+                "name",
+                "bundle_id",
+                "bundle_label",
+                "is_candidate",
+                "rank",
+                "gap_ratio",
+                "current_price",
+                "market_cap",
+                "total_volume",
+            ]
+        )
+
+    frames = [pd.read_csv(path) for path in snapshot_files]
+    history_df = pd.concat(frames, ignore_index=True)
+    history_df["snapshot_date"] = pd.to_datetime(history_df["snapshot_date"]).dt.date
+    history_df["is_candidate"] = history_df["is_candidate"].astype(str).str.lower().isin({"true", "1"})
+    for column in ["rank", "gap_ratio", "current_price", "market_cap", "total_volume"]:
+        history_df[column] = pd.to_numeric(history_df[column], errors="coerce")
+    return history_df
+
+
+def build_validation_report(
+    snapshot_history: pd.DataFrame,
+    horizon_days: int = 30,
+    min_benchmark_assets: int = 3,
+) -> dict[str, Any]:
+    if snapshot_history.empty:
+        raise ValueError("No snapshot history available for validation")
+
+    history_df = snapshot_history.copy()
+    history_df["snapshot_date"] = pd.to_datetime(history_df["snapshot_date"]).dt.date
+    history_df["is_candidate"] = history_df["is_candidate"].astype(bool)
+    for column in ["rank", "gap_ratio", "current_price", "market_cap", "total_volume"]:
+        history_df[column] = pd.to_numeric(history_df[column], errors="coerce")
+
+    price_rows = history_df[
+        ["snapshot_date", "bundle_id", "bundle_label", "asset_id", "current_price"]
+    ].drop_duplicates()
+    entry_prices = price_rows.rename(columns={"current_price": "entry_price"}).copy()
+    entry_prices["exit_date"] = entry_prices["snapshot_date"].apply(lambda value: value + timedelta(days=horizon_days))
+    exit_prices = price_rows.rename(columns={"snapshot_date": "exit_date", "current_price": "exit_price"})
+
+    returns_df = entry_prices.merge(
+        exit_prices[["exit_date", "bundle_id", "asset_id", "exit_price"]],
+        on=["exit_date", "bundle_id", "asset_id"],
+        how="inner",
+    )
+    returns_df["forward_return"] = (returns_df["exit_price"] / returns_df["entry_price"]) - 1
+
+    benchmark_df = returns_df.groupby(["snapshot_date", "bundle_id"], as_index=False).agg(
+        bundle_median_return=("forward_return", "median"),
+        benchmark_asset_count=("asset_id", "nunique"),
+    )
+
+    candidate_meta = history_df[history_df["is_candidate"]].drop_duplicates(
+        subset=["snapshot_date", "bundle_id", "asset_id"]
+    )
+    candidate_details = candidate_meta.merge(
+        returns_df[
+            [
+                "snapshot_date",
+                "bundle_id",
+                "bundle_label",
+                "asset_id",
+                "entry_price",
+                "exit_date",
+                "exit_price",
+                "forward_return",
+            ]
+        ],
+        on=["snapshot_date", "bundle_id", "bundle_label", "asset_id"],
+        how="inner",
+    ).merge(
+        benchmark_df,
+        on=["snapshot_date", "bundle_id"],
+        how="inner",
+    )
+
+    candidate_details = candidate_details[
+        candidate_details["benchmark_asset_count"] >= min_benchmark_assets
+    ].copy()
+    candidate_details["excess_return"] = candidate_details["forward_return"] - candidate_details["bundle_median_return"]
+    candidate_details["beat_bundle_median"] = candidate_details["excess_return"] > 0
+    candidate_details = candidate_details.sort_values(["snapshot_date", "bundle_label", "rank", "asset_id"]).reset_index(drop=True)
+
+    if candidate_details.empty:
+        overall_summary = {
+            "candidate_observations": 0,
+            "bundle_count_evaluated": 0,
+            "hit_rate": None,
+            "median_forward_return": None,
+            "median_bundle_return": None,
+            "median_excess_return": None,
+        }
+        bundle_summary = pd.DataFrame(
+            columns=[
+                "bundle_id",
+                "bundle_label",
+                "candidate_observations",
+                "hit_rate",
+                "median_forward_return",
+                "median_bundle_return",
+                "median_excess_return",
+            ]
+        )
+    else:
+        overall_summary = {
+            "candidate_observations": int(len(candidate_details)),
+            "bundle_count_evaluated": int(candidate_details["bundle_id"].nunique()),
+            "hit_rate": round(float(candidate_details["beat_bundle_median"].mean()), 4),
+            "median_forward_return": round(float(candidate_details["forward_return"].median()), 4),
+            "median_bundle_return": round(float(candidate_details["bundle_median_return"].median()), 4),
+            "median_excess_return": round(float(candidate_details["excess_return"].median()), 4),
+        }
+        bundle_summary = candidate_details.groupby(["bundle_id", "bundle_label"], as_index=False).agg(
+            candidate_observations=("asset_id", "count"),
+            hit_rate=("beat_bundle_median", "mean"),
+            median_forward_return=("forward_return", "median"),
+            median_bundle_return=("bundle_median_return", "median"),
+            median_excess_return=("excess_return", "median"),
+        )
+        for column in ["hit_rate", "median_forward_return", "median_bundle_return", "median_excess_return"]:
+            bundle_summary[column] = bundle_summary[column].round(4)
+
+    snapshot_dates = sorted(history_df["snapshot_date"].unique())
+    return {
+        "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "horizon_days": horizon_days,
+        "min_benchmark_assets": min_benchmark_assets,
+        "snapshot_count": int(len(snapshot_dates)),
+        "snapshot_start_date": snapshot_dates[0].isoformat() if snapshot_dates else None,
+        "snapshot_end_date": snapshot_dates[-1].isoformat() if snapshot_dates else None,
+        "overall_summary": overall_summary,
+        "bundle_summary": bundle_summary,
+        "candidate_details": candidate_details,
+    }
+
+
+def save_validation_report(
+    report: dict[str, Any],
+    output_dir: Path = VALIDATION_OUTPUT_DIR,
+) -> tuple[Path, Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    horizon_days = report["horizon_days"]
+    summary_path = output_dir / f"summary_{horizon_days}d.json"
+    bundle_summary_path = output_dir / f"bundle_summary_{horizon_days}d.csv"
+    candidate_details_path = output_dir / f"candidate_details_{horizon_days}d.csv"
+
+    summary_payload = {
+        key: value
+        for key, value in report.items()
+        if key not in {"bundle_summary", "candidate_details"}
+    }
+    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    report["bundle_summary"].to_csv(bundle_summary_path, index=False)
+    report["candidate_details"].to_csv(candidate_details_path, index=False)
+    return summary_path, bundle_summary_path, candidate_details_path
 
 
 def render_dashboard_html(payload: dict[str, Any]) -> str:

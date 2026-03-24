@@ -97,6 +97,166 @@ class ScreenerTests(unittest.TestCase):
         self.assertEqual(layer1["candidates"][0]["id"], "delta")
         self.assertEqual(layer1["candidates"][1]["id"], "gamma")
 
+    def test_build_payload_includes_graph_nodes_and_edges(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "id": "alpha",
+                    "symbol": "alp",
+                    "name": "Alpha",
+                    "current_price": 12.0,
+                    "market_cap": 12_000_000_000,
+                    "total_volume": 3_000_000_000,
+                    "price_change_percentage_24h": 2.1,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2016-01-01",
+                },
+                {
+                    "id": "beta",
+                    "symbol": "bet",
+                    "name": "Beta",
+                    "current_price": 6.0,
+                    "market_cap": 4_000_000_000,
+                    "total_volume": 1_500_000_000,
+                    "price_change_percentage_24h": 1.4,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2017-01-01",
+                },
+                {
+                    "id": "gamma",
+                    "symbol": "gam",
+                    "name": "Gamma",
+                    "current_price": 1.5,
+                    "market_cap": 1_000_000_000,
+                    "total_volume": 250_000_000,
+                    "price_change_percentage_24h": -0.8,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2018-01-01",
+                },
+                {
+                    "id": "delta",
+                    "symbol": "del",
+                    "name": "Delta",
+                    "current_price": 0.4,
+                    "market_cap": 200_000_000,
+                    "total_volume": 75_000_000,
+                    "price_change_percentage_24h": 4.3,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2019-01-01",
+                },
+            ]
+        )
+
+        payload = build_screener_payload(
+            df,
+            FilterConfig(
+                min_market_cap_usd=100_000,
+                min_volume_usd=10_000,
+                min_age_days=30,
+                min_peer_count=2,
+                max_peer_count=2,
+                min_gap_ratio=1.2,
+            ),
+        )
+
+        self.assertIn("graph", payload)
+        self.assertGreater(payload["graph"]["summary"]["node_count"], 0)
+        self.assertGreater(payload["graph"]["summary"]["edge_count"], 0)
+        node_types = {node["type"] for node in payload["graph"]["nodes"]}
+        edge_types = {edge["type"] for edge in payload["graph"]["edges"]}
+        self.assertIn("bundle", node_types)
+        self.assertIn("candidate", node_types)
+        self.assertIn("anchor_peer", node_types)
+        self.assertIn("bundle_membership", edge_types)
+        self.assertIn("peer_justification", edge_types)
+
+    def test_build_payload_includes_all_eligible_nodes_for_graph_toggle(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "id": "alpha",
+                    "symbol": "alp",
+                    "name": "Alpha",
+                    "current_price": 10.0,
+                    "market_cap": 10_000_000_000,
+                    "total_volume": 2_000_000_000,
+                    "price_change_percentage_24h": 1.0,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2016-01-01",
+                },
+                {
+                    "id": "beta",
+                    "symbol": "bet",
+                    "name": "Beta",
+                    "current_price": 6.0,
+                    "market_cap": 6_000_000_000,
+                    "total_volume": 1_000_000_000,
+                    "price_change_percentage_24h": 1.0,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2017-01-01",
+                },
+                {
+                    "id": "gamma",
+                    "symbol": "gam",
+                    "name": "Gamma",
+                    "current_price": 4.0,
+                    "market_cap": 4_000_000_000,
+                    "total_volume": 700_000_000,
+                    "price_change_percentage_24h": 1.0,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2018-01-01",
+                },
+                {
+                    "id": "delta",
+                    "symbol": "del",
+                    "name": "Delta",
+                    "current_price": 3.0,
+                    "market_cap": 3_000_000_000,
+                    "total_volume": 500_000_000,
+                    "price_change_percentage_24h": 1.0,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2019-01-01",
+                },
+                {
+                    "id": "epsilon",
+                    "symbol": "eps",
+                    "name": "Epsilon",
+                    "current_price": 2.0,
+                    "market_cap": 2_000_000_000,
+                    "total_volume": 400_000_000,
+                    "price_change_percentage_24h": 1.0,
+                    "categories": "['Layer 1 (L1)', 'Smart Contract Platform']",
+                    "hashing_algorithm": "PoS",
+                    "genesis_date": "2020-01-01",
+                },
+            ]
+        )
+
+        payload = build_screener_payload(
+            df,
+            FilterConfig(
+                min_market_cap_usd=100_000,
+                min_volume_usd=10_000,
+                min_age_days=30,
+                min_peer_count=2,
+                max_peer_count=2,
+                min_gap_ratio=2.0,
+            ),
+        )
+
+        node_types = {node["type"] for node in payload["graph"]["nodes"]}
+        self.assertIn("eligible_asset", node_types)
+        self.assertGreaterEqual(payload["graph"]["summary"]["eligible_asset_count"], 5)
+        self.assertLess(payload["graph"]["summary"]["focused_node_count"], payload["graph"]["summary"]["node_count"])
+
     def test_build_payload_filters_out_young_or_illiquid_assets(self) -> None:
         df = pd.DataFrame(
             [

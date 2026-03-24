@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import re
 import time
@@ -159,7 +160,7 @@ def get_coingecko_headers() -> dict[str, str]:
     return headers
 
 
-def fetch_coingecko_markets(pages: int = 3, per_page: int = 250, sleep_seconds: float = 1.2) -> pd.DataFrame:
+def fetch_coingecko_markets(pages: int = 6, per_page: int = 250, sleep_seconds: float = 1.2) -> pd.DataFrame:
     all_rows: list[dict[str, Any]] = []
 
     for page in range(1, pages + 1):
@@ -212,7 +213,7 @@ def fetch_coingecko_details(coin_id: str) -> dict[str, Any]:
     }
 
 
-def collect_market_dataset(pages: int = 3, sleep_seconds: float = 1.2) -> pd.DataFrame:
+def collect_market_dataset(pages: int = 6, sleep_seconds: float = 1.2) -> pd.DataFrame:
     market_df = fetch_coingecko_markets(pages=pages, sleep_seconds=sleep_seconds)
     coin_ids = market_df["id"].tolist()
     detail_rows: list[dict[str, Any]] = []
@@ -472,10 +473,258 @@ def build_bundle_payload(asset_df: pd.DataFrame, config: FilterConfig) -> list[d
     return bundles
 
 
+GRAPH_PALETTE = [
+    "#61f0d1",
+    "#ffb86b",
+    "#7ab8ff",
+    "#ff7f7f",
+    "#9cff6b",
+    "#ffd86b",
+    "#cfa8ff",
+    "#6be0ff",
+]
+
+
+def _bundle_color(index: int) -> str:
+    return GRAPH_PALETTE[index % len(GRAPH_PALETTE)]
+
+
+def build_graph_payload(
+    bundles: list[dict[str, Any]],
+    eligible_bundle_df: pd.DataFrame,
+) -> dict[str, Any]:
+    if eligible_bundle_df.empty:
+        return {"nodes": [], "edges": [], "bundles": [], "summary": {"node_count": 0, "edge_count": 0}}
+
+    bundle_lookup = {bundle["id"]: bundle for bundle in bundles}
+    ordered_bundle_ids = [bundle["id"] for bundle in bundles if bundle["id"] in set(eligible_bundle_df["bundle_id"])]
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    node_lookup: dict[str, dict[str, Any]] = {}
+    edge_keys: set[tuple[str, str, str, str | None]] = set()
+    bundle_meta: list[dict[str, Any]] = []
+
+    candidate_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    peer_lookup: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for bundle in bundles:
+        for rank, candidate in enumerate(bundle["candidates"], start=1):
+            candidate_lookup[(bundle["id"], candidate["id"])] = {
+                "candidate": candidate,
+                "rank": rank,
+            }
+            for peer in candidate["peer_assets"]:
+                peer_lookup.setdefault((bundle["id"], peer["id"]), []).append(
+                    {
+                        "id": candidate["id"],
+                        "name": candidate["name"],
+                        "bundle_id": bundle["id"],
+                        "bundle_label": bundle["label"],
+                    }
+                )
+
+    type_priority = {
+        "bundle": 3,
+        "candidate": 2,
+        "anchor_peer": 1,
+        "eligible_asset": 0,
+    }
+
+    def register_node(node: dict[str, Any]) -> dict[str, Any]:
+        existing = node_lookup.get(node["id"])
+        if not existing:
+            node_lookup[node["id"]] = node
+            nodes.append(node)
+            return node
+
+        existing_bundle_ids = set(existing.get("bundle_ids", []))
+        existing_bundle_labels = set(existing.get("bundle_labels", []))
+        incoming_bundle_ids = set(node.get("bundle_ids", []))
+        incoming_bundle_labels = set(node.get("bundle_labels", []))
+        existing["bundle_ids"] = sorted(existing_bundle_ids | incoming_bundle_ids)
+        existing["bundle_labels"] = sorted(existing_bundle_labels | incoming_bundle_labels)
+
+        if type_priority.get(node.get("type"), -1) > type_priority.get(existing.get("type"), -1):
+            existing["type"] = node["type"]
+
+        if node.get("candidate"):
+            existing["candidate"] = True
+            existing["rank"] = node.get("rank")
+            existing["gap_ratio"] = node.get("gap_ratio")
+            existing["explanation"] = node.get("explanation")
+            existing["matched_features"] = node.get("matched_features", [])
+            existing["peer_assets"] = node.get("peer_assets", [])
+        existing["market_cap"] = max(existing.get("market_cap") or 0, node.get("market_cap") or 0) or None
+        existing["is_anchor_peer"] = bool(existing.get("is_anchor_peer")) or bool(node.get("is_anchor_peer"))
+        existing["is_eligible"] = bool(existing.get("is_eligible", False)) or bool(node.get("is_eligible", False))
+
+        related_candidates = existing.get("related_candidates", []) + node.get("related_candidates", [])
+        if related_candidates:
+            deduped = {(item["id"], item["bundle_id"]): item for item in related_candidates}
+            existing["related_candidates"] = list(deduped.values())
+
+        for axis in ("x", "y", "z"):
+            if axis in node:
+                existing[axis] = round((float(existing.get(axis, 0)) + float(node[axis])) / 2, 2)
+        return existing
+
+    def register_edge(edge: dict[str, Any]) -> None:
+        edge_key = (edge["source"], edge["target"], edge["type"], edge.get("bundle_id"))
+        if edge_key in edge_keys:
+            return
+        edge_keys.add(edge_key)
+        edges.append(edge)
+
+    bundle_count = max(len(ordered_bundle_ids), 1)
+    for bundle_index, bundle_id in enumerate(ordered_bundle_ids):
+        bundle = bundle_lookup[bundle_id]
+        group = eligible_bundle_df[eligible_bundle_df["bundle_id"] == bundle_id].sort_values("market_cap", ascending=False, na_position="last").reset_index(drop=True)
+        color = _bundle_color(bundle_index)
+        angle = (2 * math.pi * bundle_index) / bundle_count
+        hub_x = round(math.cos(angle) * 520, 2)
+        hub_z = round(math.sin(angle) * 520, 2)
+        hub_y = float(((bundle_index % 4) - 1.5) * 90)
+        bundle_node_id = f"bundle:{bundle_id}"
+
+        register_node(
+            {
+                "id": bundle_node_id,
+                "type": "bundle",
+                "label": bundle["label"],
+                "bundle_id": bundle_id,
+                "bundle_ids": [bundle_id],
+                "bundle_labels": [bundle["label"]],
+                "candidate_count": bundle["candidate_count"],
+                "eligible_asset_count": int(len(group)),
+                "top_gap_ratio": bundle["top_gap_ratio"],
+                "description": bundle["description"],
+                "top_candidates": [candidate["name"] for candidate in bundle["candidates"][:4]],
+                "color": color,
+                "x": hub_x,
+                "y": hub_y,
+                "z": hub_z,
+            }
+        )
+        bundle_meta.append(
+            {
+                "id": bundle_id,
+                "label": bundle["label"],
+                "color": color,
+                "candidate_count": bundle["candidate_count"],
+                "eligible_asset_count": int(len(group)),
+                "top_gap_ratio": bundle["top_gap_ratio"],
+                "has_candidates": bundle["candidate_count"] > 0,
+            }
+        )
+
+        asset_count = max(len(group), 1)
+        for asset_index, asset in enumerate(group.itertuples(index=False)):
+            asset_key = (bundle_id, asset.asset_id)
+            candidate_meta = candidate_lookup.get(asset_key)
+            related_candidates = peer_lookup.get(asset_key, [])
+            if candidate_meta:
+                node_type = "candidate"
+                orbit_radius = 180 + 28 * (asset_index % 4)
+                y_offset = ((asset_index % 5) - 2) * 34
+            elif related_candidates:
+                node_type = "anchor_peer"
+                orbit_radius = 320 + 22 * (asset_index % 4)
+                y_offset = ((asset_index % 4) - 1.5) * 54
+            else:
+                node_type = "eligible_asset"
+                orbit_radius = 255 + 18 * (asset_index % 5)
+                y_offset = ((asset_index % 6) - 2.5) * 28
+
+            asset_angle = angle + (2 * math.pi * asset_index / asset_count)
+            asset_x = hub_x + math.cos(asset_angle) * orbit_radius
+            asset_z = hub_z + math.sin(asset_angle) * orbit_radius
+            asset_y = hub_y + y_offset
+            node = {
+                "id": f"asset:{asset.asset_id}",
+                "asset_id": asset.asset_id,
+                "type": node_type,
+                "candidate": bool(candidate_meta),
+                "is_anchor_peer": bool(related_candidates),
+                "is_eligible": True,
+                "label": asset.name,
+                "symbol": asset.symbol.upper(),
+                "bundle_ids": [bundle_id],
+                "bundle_labels": [bundle["label"]],
+                "market_cap": float(asset.market_cap) if pd.notna(asset.market_cap) else None,
+                "color": color,
+                "x": round(asset_x, 2),
+                "y": round(asset_y, 2),
+                "z": round(asset_z, 2),
+            }
+            if candidate_meta:
+                candidate = candidate_meta["candidate"]
+                node.update(
+                    {
+                        "rank": candidate_meta["rank"],
+                        "gap_ratio": candidate["gap_ratio"],
+                        "matched_features": candidate["matched_features"],
+                        "peer_assets": candidate["peer_assets"],
+                        "explanation": candidate["explanation"],
+                    }
+                )
+            if related_candidates:
+                node["related_candidates"] = related_candidates
+
+            register_node(node)
+            register_edge(
+                {
+                    "source": bundle_node_id,
+                    "target": f"asset:{asset.asset_id}",
+                    "type": "bundle_membership",
+                    "bundle_id": bundle_id,
+                    "weight": candidate_meta["candidate"]["gap_ratio"] if candidate_meta else 0.35,
+                    "color": color,
+                }
+            )
+
+        for candidate in bundle["candidates"]:
+            candidate_node_id = f"asset:{candidate['id']}"
+            for peer_index, peer in enumerate(candidate["peer_assets"]):
+                register_edge(
+                    {
+                        "source": candidate_node_id,
+                        "target": f"asset:{peer['id']}",
+                        "type": "peer_justification",
+                        "bundle_id": bundle_id,
+                        "weight": round(1 / (peer_index + 1), 3),
+                        "color": color,
+                    }
+                )
+
+    for node in nodes:
+        if "bundle_ids" in node:
+            node["bundle_ids"] = sorted(node["bundle_ids"])
+        if "bundle_labels" in node:
+            node["bundle_labels"] = sorted(node["bundle_labels"])
+        if node.get("related_candidates"):
+            node["related_candidates"] = sorted(node["related_candidates"], key=lambda item: (item["bundle_label"], item["name"]))
+
+    focused_node_count = sum(1 for node in nodes if node["type"] != "eligible_asset" and (node["type"] != "bundle" or node.get("candidate_count", 0) > 0))
+    eligible_asset_count = sum(1 for node in nodes if node.get("is_eligible"))
+    return {
+        "bundles": bundle_meta,
+        "nodes": nodes,
+        "edges": edges,
+        "summary": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "focused_node_count": focused_node_count,
+            "eligible_asset_count": eligible_asset_count,
+        },
+    }
+
+
 def build_screener_payload(raw_df: pd.DataFrame, config: FilterConfig | None = None) -> dict[str, Any]:
     active_config = config or FilterConfig()
     prepared_df = prepare_asset_frame(raw_df, active_config)
     bundles = build_bundle_payload(prepared_df, active_config)
+    bundle_df = expand_bundle_memberships(prepared_df)
+    eligible_bundle_df = bundle_df[bundle_df["passes_basic_filters"]].copy()
     eligible_assets = prepared_df[
         prepared_df["passes_basic_filters"] & prepared_df["bundle_ids"].apply(bool)
     ]
@@ -490,6 +739,7 @@ def build_screener_payload(raw_df: pd.DataFrame, config: FilterConfig | None = N
             "candidate_count": int(sum(bundle["candidate_count"] for bundle in bundles)),
         },
         "bundles": bundles,
+        "graph": build_graph_payload(bundles, eligible_bundle_df),
     }
 
 
@@ -736,291 +986,315 @@ def save_validation_report(
 
 def render_dashboard_html(payload: dict[str, Any]) -> str:
     payload_json = json.dumps(payload, separators=(",", ":"))
-    return f"""<!doctype html>
-<html lang=\"en\">
+    html = """<!doctype html>
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Crypto Similarity Screener</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crypto Similarity Graph</title>
   <style>
-    :root {{
-      --bg: #07111f;
-      --panel: rgba(8, 20, 36, 0.82);
-      --panel-strong: rgba(10, 27, 48, 0.95);
-      --line: rgba(148, 185, 255, 0.18);
-      --text: #ecf4ff;
+    :root {
+      --bg: #04101c;
+      --panel: rgba(7, 18, 32, 0.84);
+      --line: rgba(142, 187, 255, 0.18);
+      --text: #eef5ff;
       --muted: #99afc9;
       --accent: #61f0d1;
-      --accent-warm: #ffb86b;
-      --danger: #ff7f7f;
-      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      --warm: #ffb86b;
+      --shadow: 0 26px 80px rgba(0, 0, 0, 0.38);
       --radius: 24px;
-    }}
+    }
 
-    * {{ box-sizing: border-box; }}
-    body {{
+    * { box-sizing: border-box; }
+    body {
       margin: 0;
+      min-height: 100vh;
       font-family: "Avenir Next", "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(97, 240, 209, 0.16), transparent 28%),
-        radial-gradient(circle at top right, rgba(255, 184, 107, 0.16), transparent 26%),
-        linear-gradient(180deg, #040b14 0%, #081323 45%, #07111f 100%);
-      min-height: 100vh;
-    }}
+        radial-gradient(circle at top left, rgba(97, 240, 209, 0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(255, 184, 107, 0.16), transparent 24%),
+        linear-gradient(180deg, #020912 0%, #07111d 42%, #06111e 100%);
+    }
 
-    .shell {{
-      width: min(1440px, calc(100vw - 32px));
-      margin: 24px auto 40px;
-    }}
-
-    .hero {{
-      padding: 28px;
-      border: 1px solid var(--line);
-      border-radius: 32px;
-      background: linear-gradient(135deg, rgba(9, 22, 39, 0.94), rgba(7, 15, 27, 0.88));
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      position: relative;
-    }}
-
-    .hero::after {{
-      content: "";
-      position: absolute;
-      inset: auto -12% -50% auto;
-      width: 320px;
-      height: 320px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(97, 240, 209, 0.18), transparent 68%);
-      pointer-events: none;
-    }}
-
-    h1, h2, h3 {{
+    h1, h2, h3 {
+      margin: 0;
       font-family: "Iowan Old Style", "Palatino Linotype", serif;
       letter-spacing: 0.01em;
-      margin: 0;
-    }}
+    }
 
-    .eyebrow {{
-      text-transform: uppercase;
-      letter-spacing: 0.24em;
-      color: var(--accent);
-      font-size: 12px;
-      margin-bottom: 10px;
-    }}
-
-    .hero p {{
-      max-width: 880px;
-      color: var(--muted);
-      margin: 12px 0 0;
-      line-height: 1.55;
-    }}
-
-    .stat-grid {{
+    .shell {
+      width: min(1520px, calc(100vw - 28px));
+      margin: 16px auto 32px;
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 14px;
-      margin-top: 24px;
-    }}
+      gap: 16px;
+    }
 
-    .stat-card, .panel {{
+    .panel {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      backdrop-filter: blur(10px);
-    }}
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
 
-    .stat-card {{ padding: 18px 20px; }}
-    .stat-label {{ color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; }}
-    .stat-value {{ font-size: 30px; margin-top: 8px; }}
+    .hero {
+      padding: 26px 28px;
+      background: linear-gradient(135deg, rgba(8, 20, 35, 0.96), rgba(5, 14, 24, 0.9));
+      position: relative;
+      overflow: hidden;
+    }
 
-    .controls {{
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 320px;
+      height: 320px;
+      right: -60px;
+      top: -120px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(97, 240, 209, 0.16), transparent 68%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.22em;
+      font-size: 12px;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+
+    .hero-copy {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
+      gap: 18px;
+      align-items: end;
+    }
+
+    .hero p {
+      margin: 12px 0 0;
+      color: var(--muted);
+      max-width: 860px;
+      line-height: 1.6;
+    }
+
+    .stat-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 14px;
-      margin: 18px 0;
-    }}
+      gap: 12px;
+      margin-top: 22px;
+    }
 
-    .control {{ padding: 18px; }}
-    .control label {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.08em; }}
-    .control select, .control input {{
+    .stat {
+      padding: 16px 18px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(142, 187, 255, 0.12);
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .stat-value {
+      margin-top: 8px;
+      font-size: 28px;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .control { padding: 16px 18px; }
+    .control label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .control select, .control button {
       width: 100%;
       border-radius: 16px;
-      border: 1px solid rgba(148, 185, 255, 0.26);
-      background: rgba(5, 13, 23, 0.82);
+      border: 1px solid rgba(142, 187, 255, 0.18);
+      background: rgba(5, 13, 23, 0.86);
       color: var(--text);
-      padding: 12px 14px;
+      padding: 11px 13px;
       font: inherit;
-    }}
+      cursor: pointer;
+    }
 
-    .layout {{
+    .layout {
       display: grid;
-      grid-template-columns: 320px minmax(0, 1fr);
-      gap: 18px;
-      align-items: start;
-    }}
+      grid-template-columns: 280px minmax(0, 1fr) 320px;
+      gap: 16px;
+      min-height: 720px;
+      align-items: stretch;
+    }
 
-    .bundle-list {{ padding: 18px; position: sticky; top: 16px; }}
-    .bundle-item {{
-      display: block;
+    .sidebar, .detail { padding: 18px; }
+    .sidebar h2, .detail h2 { font-size: 24px; margin-bottom: 14px; }
+    .bundle-list { display: grid; gap: 10px; }
+    .bundle-chip {
       width: 100%;
-      background: transparent;
       border: 1px solid transparent;
-      color: inherit;
-      text-align: left;
-      padding: 16px;
       border-radius: 18px;
-      margin-bottom: 10px;
+      background: rgba(255, 255, 255, 0.03);
+      color: inherit;
+      padding: 14px;
+      text-align: left;
       cursor: pointer;
       transition: 140ms ease;
-    }}
+    }
 
-    .bundle-item:hover, .bundle-item.active {{
-      border-color: rgba(97, 240, 209, 0.38);
+    .bundle-chip:hover, .bundle-chip.active {
+      border-color: rgba(97, 240, 209, 0.34);
       background: rgba(97, 240, 209, 0.08);
       transform: translateY(-1px);
-    }}
+    }
 
-    .bundle-title {{ font-size: 18px; }}
-    .bundle-meta {{ margin-top: 6px; color: var(--muted); font-size: 13px; }}
+    .bundle-chip .meta { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .bundle-swatch { width: 12px; height: 12px; border-radius: 999px; display: inline-block; margin-right: 8px; vertical-align: middle; }
 
-    .results {{ padding: 22px; }}
-    .results-header {{ display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 20px; }}
-    .results-header p {{ margin: 8px 0 0; color: var(--muted); line-height: 1.5; }}
+    .stage {
+      position: relative;
+      overflow: hidden;
+      min-height: 720px;
+      background:
+        radial-gradient(circle at 50% 12%, rgba(97, 240, 209, 0.06), transparent 28%),
+        linear-gradient(180deg, rgba(6, 17, 30, 0.98), rgba(4, 11, 20, 0.94));
+    }
 
-    .pill-row {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }}
-    .pill {{
-      border-radius: 999px;
-      padding: 8px 12px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(148, 185, 255, 0.18);
+    .stage canvas { width: 100%; height: 100%; display: block; }
+    .hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .hud-card {
+      pointer-events: auto;
+      padding: 10px 12px;
+      border-radius: 16px;
+      background: rgba(7, 18, 32, 0.72);
+      border: 1px solid rgba(142, 187, 255, 0.14);
       color: var(--muted);
       font-size: 13px;
-    }}
+    }
 
-    table {{ width: 100%; border-collapse: collapse; margin-top: 18px; }}
-    th, td {{ padding: 14px 10px; border-bottom: 1px solid rgba(148, 185, 255, 0.12); text-align: left; vertical-align: top; }}
-    th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }}
-    td strong {{ display: block; font-size: 15px; }}
-    td span {{ color: var(--muted); font-size: 13px; }}
+    .detail p, .detail li { color: var(--muted); line-height: 1.55; }
+    .detail ul { margin: 0; padding-left: 18px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 14px 0; }
+    .metric { padding: 12px; border-radius: 16px; background: rgba(255,255,255,0.04); border: 1px solid rgba(142, 187, 255, 0.12); }
+    .metric-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric-value { margin-top: 6px; font-size: 18px; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .pill { padding: 7px 10px; border-radius: 999px; background: rgba(255,255,255,0.05); border: 1px solid rgba(142, 187, 255, 0.14); color: var(--muted); font-size: 12px; }
+    .note { color: var(--muted); font-size: 13px; }
 
-    .cards {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 14px;
-      margin-top: 18px;
-    }}
+    @media (max-width: 1240px) {
+      .layout { grid-template-columns: 1fr; }
+      .hero-copy { grid-template-columns: 1fr; }
+      .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stage { min-height: 620px; }
+    }
 
-    .candidate-card {{ padding: 18px; }}
-    .candidate-card h3 {{ font-size: 24px; }}
-    .candidate-card p {{ color: var(--muted); line-height: 1.5; }}
-    .candidate-card .gap {{ color: var(--accent-warm); font-size: 28px; margin: 10px 0 4px; }}
-    .peer-list, .feature-list {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
-    .peer, .feature {{
-      padding: 7px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      background: rgba(97, 240, 209, 0.08);
-      border: 1px solid rgba(97, 240, 209, 0.2);
-    }}
-
-    .empty {{
-      margin-top: 18px;
-      padding: 28px;
-      border-radius: 22px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px dashed rgba(148, 185, 255, 0.2);
-      color: var(--muted);
-    }}
-
-    .down {{ color: var(--danger); }}
-    .up {{ color: var(--accent); }}
-
-    @media (max-width: 1080px) {{
-      .layout {{ grid-template-columns: 1fr; }}
-      .bundle-list {{ position: static; }}
-      .controls, .stat-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-    }}
-
-    @media (max-width: 720px) {{
-      .shell {{ width: min(100vw - 18px, 100%); margin: 12px auto 24px; }}
-      .hero, .results, .bundle-list, .control, .stat-card {{ padding: 18px; border-radius: 22px; }}
-      .controls, .stat-grid {{ grid-template-columns: 1fr; }}
-      .results-header {{ flex-direction: column; }}
-      table, thead, tbody, th, td, tr {{ display: block; }}
-      thead {{ display: none; }}
-      tr {{ padding: 12px 0; border-bottom: 1px solid rgba(148, 185, 255, 0.12); }}
-      td {{ border: 0; padding: 6px 0; }}
-      td::before {{ content: attr(data-label); display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }}
-    }}
+    @media (max-width: 720px) {
+      .shell { width: min(100vw - 18px, 100%); margin: 10px auto 20px; }
+      .hero, .control, .sidebar, .detail { padding: 18px; }
+      .toolbar, .stat-grid { grid-template-columns: 1fr; }
+      .stage { min-height: 480px; }
+      .hud { flex-direction: column; align-items: flex-start; }
+    }
   </style>
 </head>
 <body>
-  <div class=\"shell\">
-    <section class=\"hero\">
-      <div class=\"eyebrow\">Crypto Similarity Screener</div>
-      <h1>Find smaller coins sitting inside stronger peer sets.</h1>
-      <p>Each bundle groups assets by normalized CoinGecko features, filters out low-signal names, and ranks the survivors by how far below their next larger peers they trade on market cap.</p>
-      <div class=\"stat-grid\" id=\"stats\"></div>
+  <div class="shell">
+    <section class="panel hero">
+      <div class="eyebrow">Crypto Similarity Graph</div>
+      <div class="hero-copy">
+        <div>
+          <h1>See the bundle structure instead of reading it as a table.</h1>
+          <p>This graph centers bundle hubs, candidate nodes, and the larger peers that justified each pick. Drag to orbit, use the wheel to zoom, and click nodes to inspect why a coin is where it is.</p>
+        </div>
+        <div class="note">Primary view: 3D bundle map. Default density: surfaced candidates plus anchor peers only.</div>
+      </div>
+      <div class="stat-grid" id="stats"></div>
     </section>
 
-    <section class=\"controls\">
-      <div class=\"panel control\">
-        <label for=\"sortBy\">Sort Candidates</label>
-        <select id=\"sortBy\">
-          <option value=\"score\">Peer Gap</option>
-          <option value=\"market_cap\">Market Cap</option>
-          <option value=\"total_volume\">24h Volume</option>
-          <option value=\"price_change_percentage_24h\">24h Price Change</option>
+    <section class="toolbar">
+      <div class="panel control">
+        <label for="bundleFilter">Bundle Focus</label>
+        <select id="bundleFilter"></select>
+      </div>
+      <div class="panel control">
+        <label for="nodeScope">Node Scope</label>
+        <select id="nodeScope">
+          <option value="focused">Candidates + Anchor Peers</option>
+          <option value="eligible">All Eligible Assets</option>
         </select>
       </div>
-      <div class=\"panel control\">
-        <label for=\"minVolume\">Minimum 24h Volume</label>
-        <input id=\"minVolume\" type=\"number\" min=\"0\" step=\"100000\" />
-      </div>
-      <div class=\"panel control\">
-        <label for=\"minAge\">Minimum Age (days)</label>
-        <input id=\"minAge\" type=\"number\" min=\"0\" step=\"30\" />
-      </div>
-      <div class=\"panel control\">
-        <label for=\"capBand\">Market Cap Band</label>
-        <select id=\"capBand\">
-          <option value=\"all\">All</option>
-          <option value=\"micro\">$10M to $100M</option>
-          <option value=\"small\">$100M to $1B</option>
-          <option value=\"mid\">$1B to $10B</option>
-          <option value=\"large\">$10B+</option>
+      <div class="panel control">
+        <label for="labelDensity">Labels</label>
+        <select id="labelDensity">
+          <option value="smart">Smart Labels</option>
+          <option value="all">Show More</option>
+          <option value="minimal">Minimal</option>
         </select>
+      </div>
+      <div class="panel control">
+        <label>&nbsp;</label>
+        <button id="resetView">Reset View</button>
       </div>
     </section>
 
-    <section class=\"layout\">
-      <aside class=\"panel bundle-list\">
-        <h2>Bundles</h2>
-        <div id=\"bundleList\"></div>
+    <section class="layout">
+      <aside class="panel sidebar">
+        <h2>Bundle Clusters</h2>
+        <div class="bundle-list" id="bundleLegend"></div>
       </aside>
 
-      <main class=\"panel results\">
-        <div class=\"results-header\" id=\"bundleHeader\"></div>
-        <div id=\"candidateTable\"></div>
-        <div class=\"cards\" id=\"candidateCards\"></div>
+      <main class="panel stage">
+        <canvas id="graphCanvas"></canvas>
+        <div class="hud">
+          <div class="hud-card">Drag: orbit • Wheel: zoom • Click: inspect</div>
+          <div class="hud-card" id="hudSummary"></div>
+        </div>
       </main>
+
+      <aside class="panel detail" id="detailPanel"></aside>
     </section>
   </div>
 
   <script>
-    const PAYLOAD = {payload_json};
-    const state = {{
-      selectedBundle: PAYLOAD.bundles[0] ? PAYLOAD.bundles[0].id : null,
-      sortBy: 'score',
-      minVolume: PAYLOAD.config.min_volume_usd,
-      minAge: PAYLOAD.config.min_age_days,
-      capBand: 'all',
-    }};
+    const PAYLOAD = __PAYLOAD_JSON__;
+    const GRAPH = PAYLOAD.graph;
+    const NODE_MAP = new Map(GRAPH.nodes.map((node) => [node.id, node]));
+    const canvas = document.getElementById('graphCanvas');
+    const ctx = canvas.getContext('2d');
 
-    const formatCompact = (value) => new Intl.NumberFormat('en-US', {{ notation: 'compact', maximumFractionDigits: 1 }}).format(value || 0);
-    const formatCurrency = (value) => new Intl.NumberFormat('en-US', {{ style: 'currency', currency: 'USD', maximumFractionDigits: value >= 1 ? 0 : 4 }}).format(value || 0);
-    const formatPercent = (value) => `${{value >= 0 ? '+' : ''}}${{(value || 0).toFixed(2)}}%`;
+    const state = {
+      selectedBundle: 'all',
+      nodeScope: 'focused',
+      labelDensity: 'smart',
+      selectedId: GRAPH.nodes.find((node) => node.type === 'candidate')?.id || GRAPH.nodes[0]?.id || null,
+      zoom: 1.08,
+      rotX: -0.42,
+      rotY: 0.56,
+    };
+
+    let projectedNodes = [];
+    let isDragging = false;
+    let dragMoved = false;
+    let lastPointer = null;
+
+    const formatCompact = (value) => new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value || 0);
+    const formatCurrency = (value) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: value >= 1 ? 0 : 4 }).format(value || 0);
     const escapeHtml = (value) => String(value)
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
@@ -1028,159 +1302,343 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&#039;');
 
-    function passesBand(candidate) {{
-      const cap = candidate.market_cap || 0;
-      if (state.capBand === 'micro') return cap >= 1e7 && cap < 1e8;
-      if (state.capBand === 'small') return cap >= 1e8 && cap < 1e9;
-      if (state.capBand === 'mid') return cap >= 1e9 && cap < 1e10;
-      if (state.capBand === 'large') return cap >= 1e10;
-      return true;
-    }}
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
 
-    function getBundle(bundleId) {{
-      return PAYLOAD.bundles.find((bundle) => bundle.id === bundleId) || PAYLOAD.bundles[0] || null;
-    }}
+    function getVisibleNodes() {
+      return GRAPH.nodes.filter((node) => {
+        const inBundle = state.selectedBundle === 'all' || node.bundle_id === state.selectedBundle || (node.bundle_ids || []).includes(state.selectedBundle);
+        if (!inBundle) return false;
+        if (state.nodeScope === 'focused') {
+          if (node.type === 'eligible_asset') return false;
+          if (node.type === 'bundle' && !(node.candidate_count > 0)) return false;
+        }
+        return true;
+      });
+    }
 
-    function getVisibleCandidates(bundle) {{
-      const candidates = [...bundle.candidates].filter((candidate) =>
-        (candidate.total_volume || 0) >= state.minVolume &&
-        (candidate.age_days || 0) >= state.minAge &&
-        passesBand(candidate)
-      );
+    function getVisibleEdges(visibleIds) {
+      return GRAPH.edges.filter((edge) => {
+        return visibleIds.has(edge.source) && visibleIds.has(edge.target);
+      });
+    }
 
-      candidates.sort((left, right) => {{
-        if (state.sortBy === 'market_cap' || state.sortBy === 'total_volume') return (right[state.sortBy] || 0) - (left[state.sortBy] || 0);
-        if (state.sortBy === 'price_change_percentage_24h') return (right[state.sortBy] || 0) - (left[state.sortBy] || 0);
-        return (right.score || 0) - (left.score || 0);
-      }});
+    function ensureSelection(visibleNodes) {
+      if (!visibleNodes.length) {
+        state.selectedId = null;
+        return;
+      }
+      const visibleIds = new Set(visibleNodes.map((node) => node.id));
+      if (!visibleIds.has(state.selectedId)) {
+        state.selectedId = visibleNodes.find((node) => node.type === 'candidate')?.id || visibleNodes[0].id;
+      }
+    }
 
-      return candidates;
-    }}
+    function transformNode(node, width, height) {
+      const cosY = Math.cos(state.rotY);
+      const sinY = Math.sin(state.rotY);
+      const cosX = Math.cos(state.rotX);
+      const sinX = Math.sin(state.rotX);
 
-    function renderStats() {{
+      const x1 = node.x * cosY - node.z * sinY;
+      const z1 = node.x * sinY + node.z * cosY;
+      const y1 = node.y * cosX - z1 * sinX;
+      const z2 = node.y * sinX + z1 * cosX;
+      const camera = 1380 / state.zoom;
+      const perspective = camera / (camera - z2);
+      const screenX = width / 2 + x1 * perspective;
+      const screenY = height / 2 + y1 * perspective;
+      const marketCap = node.market_cap || 0;
+      const capScale = marketCap ? Math.max(0, Math.log10(marketCap) - 7) : 0;
+      const baseRadius = node.type === 'bundle' ? 18 : node.type === 'candidate' ? 10 : 7.5;
+
+      return {
+        ...node,
+        depth: z2,
+        screenX,
+        screenY,
+        radius: baseRadius + capScale * (node.type === 'bundle' ? 0.4 : 0.7),
+      };
+    }
+
+    function shouldLabel(node) {
+      if (state.labelDensity === 'minimal') return node.id === state.selectedId;
+      if (state.labelDensity === 'all') return true;
+      return node.type === 'bundle' || node.type === 'candidate' || node.id === state.selectedId;
+    }
+
+    function renderStats() {
+      const visibleNodeTarget = state.nodeScope === 'focused' ? GRAPH.summary.focused_node_count : GRAPH.summary.node_count;
       const stats = [
         ['Assets Loaded', formatCompact(PAYLOAD.summary.total_assets)],
         ['Eligible Assets', formatCompact(PAYLOAD.summary.eligible_assets)],
-        ['Tracked Bundles', formatCompact(PAYLOAD.summary.bundle_count)],
-        ['Candidates Surfaced', formatCompact(PAYLOAD.summary.candidate_count)],
+        ['Visible Universe', formatCompact(visibleNodeTarget)],
+        ['Graph Edges', formatCompact(GRAPH.summary.edge_count)],
       ];
       document.getElementById('stats').innerHTML = stats.map(([label, value]) => `
-        <div class=\"stat-card\">
-          <div class=\"stat-label\">${{label}}</div>
-          <div class=\"stat-value\">${{value}}</div>
+        <div class="stat">
+          <div class="stat-label">${label}</div>
+          <div class="stat-value">${value}</div>
         </div>
       `).join('');
-    }}
+    }
 
-    function renderBundleList() {{
-      const selected = state.selectedBundle;
-      document.getElementById('bundleList').innerHTML = PAYLOAD.bundles.map((bundle) => `
-        <button class=\"bundle-item ${{bundle.id === selected ? 'active' : ''}}\" data-bundle=\"${{bundle.id}}\">
-          <div class=\"bundle-title\">${{escapeHtml(bundle.label)}}</div>
-          <div class=\"bundle-meta\">${{bundle.candidate_count}} ranked candidates • ${{bundle.eligible_asset_count}} eligible assets</div>
-          <div class=\"bundle-meta\">Top peer gap: ${{bundle.top_gap_ratio ? `${{bundle.top_gap_ratio.toFixed(1)}}x` : 'n/a'}}</div>
+    function renderBundleFilter() {
+      const select = document.getElementById('bundleFilter');
+      select.innerHTML = '<option value="all">All Bundles</option>' + GRAPH.bundles.map((bundle) => `
+        <option value="${bundle.id}">${escapeHtml(bundle.label)} (${bundle.candidate_count})</option>
+      `).join('');
+      select.value = state.selectedBundle;
+    }
+
+    function renderLegend() {
+      document.getElementById('bundleLegend').innerHTML = GRAPH.bundles.map((bundle) => `
+        <button class="bundle-chip ${bundle.id === state.selectedBundle ? 'active' : ''}" data-bundle="${bundle.id}">
+          <div><span class="bundle-swatch" style="background:${bundle.color};"></span>${escapeHtml(bundle.label)}</div>
+          <div class="meta">${bundle.candidate_count} candidates • ${bundle.eligible_asset_count} eligible</div>
+          <div class="meta">Top peer gap: ${bundle.top_gap_ratio ? `${bundle.top_gap_ratio.toFixed(1)}x` : 'n/a'}</div>
         </button>
       `).join('');
 
-      document.querySelectorAll('[data-bundle]').forEach((button) => {{
-        button.addEventListener('click', () => {{
+      document.querySelectorAll('[data-bundle]').forEach((button) => {
+        button.addEventListener('click', () => {
           state.selectedBundle = button.dataset.bundle;
-          render();
-        }});
-      }});
-    }}
+          document.getElementById('bundleFilter').value = state.selectedBundle;
+          draw();
+        });
+      });
+    }
 
-    function renderBundleHeader(bundle, candidates) {{
-      const medianCap = bundle.median_market_cap ? formatCurrency(bundle.median_market_cap) : 'n/a';
-      document.getElementById('bundleHeader').innerHTML = `
-        <div>
-          <h2>${{escapeHtml(bundle.label)}}</h2>
-          <p>${{escapeHtml(bundle.description)}}</p>
-          <div class=\"pill-row\">
-            <span class=\"pill\">${{bundle.asset_count}} tagged assets</span>
-            <span class=\"pill\">${{bundle.eligible_asset_count}} pass baseline filters</span>
-            <span class=\"pill\">Median cap of eligible set: ${{medianCap}}</span>
-            <span class=\"pill\">${{candidates.length}} candidates after your filters</span>
-          </div>
-        </div>
-        <div class=\"pill\">Generated ${{escapeHtml(PAYLOAD.generated_at)}}</div>
-      `;
-    }}
-
-    function renderTable(candidates) {{
-      if (!candidates.length) {{
-        document.getElementById('candidateTable').innerHTML = `<div class=\"empty\">No candidates remain after the current filters. Lower the age or volume threshold, or switch to a different bundle.</div>`;
+    function renderDetail(selectedNode) {
+      const detail = document.getElementById('detailPanel');
+      if (!selectedNode) {
+        detail.innerHTML = '<h2>No Selection</h2><p>Select a node to inspect its bundle, ranking, and peer relationships.</p>';
         return;
-      }}
+      }
 
-      const rows = candidates.map((candidate, index) => `
-        <tr>
-          <td data-label=\"Rank\">${{index + 1}}</td>
-          <td data-label=\"Asset\"><strong>${{escapeHtml(candidate.name)}}</strong><span>${{escapeHtml(candidate.symbol)}}</span></td>
-          <td data-label=\"Peer Gap\">${{candidate.gap_ratio.toFixed(1)}}x</td>
-          <td data-label=\"Market Cap\">${{formatCurrency(candidate.market_cap)}}</td>
-          <td data-label=\"24h Volume\">${{formatCurrency(candidate.total_volume)}}</td>
-          <td data-label=\"24h Change\"><span class=\"${{(candidate.price_change_percentage_24h || 0) >= 0 ? 'up' : 'down'}}\">${{formatPercent(candidate.price_change_percentage_24h || 0)}}</span></td>
-          <td data-label=\"Peer Set\">${{candidate.peer_assets.map((peer) => escapeHtml(peer.name)).join(', ')}}</td>
-        </tr>
-      `).join('');
+      if (selectedNode.type === 'bundle') {
+        detail.innerHTML = `
+          <h2>${escapeHtml(selectedNode.label)}</h2>
+          <p>${escapeHtml(selectedNode.description || 'Bundle hub')}</p>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Candidates</div><div class="metric-value">${selectedNode.candidate_count}</div></div>
+            <div class="metric"><div class="metric-label">Eligible Assets</div><div class="metric-value">${selectedNode.eligible_asset_count}</div></div>
+            <div class="metric"><div class="metric-label">Top Gap</div><div class="metric-value">${selectedNode.top_gap_ratio ? `${selectedNode.top_gap_ratio.toFixed(1)}x` : 'n/a'}</div></div>
+            <div class="metric"><div class="metric-label">Node Type</div><div class="metric-value">Bundle Hub</div></div>
+          </div>
+          <div class="pill-row">${(selectedNode.top_candidates || []).map((name) => `<span class="pill">${escapeHtml(name)}</span>`).join('')}</div>
+          <p class="note">Bundle hubs anchor each cluster and keep the layout stable while you orbit the graph.</p>
+        `;
+        return;
+      }
 
-      document.getElementById('candidateTable').innerHTML = `
-        <table>
-          <thead>
-            <tr>
-              <th>Rank</th>
-              <th>Asset</th>
-              <th>Peer Gap</th>
-              <th>Market Cap</th>
-              <th>24h Volume</th>
-              <th>24h Change</th>
-              <th>Peer Set</th>
-            </tr>
-          </thead>
-          <tbody>${{rows}}</tbody>
-        </table>
+      if (selectedNode.type === 'candidate') {
+        detail.innerHTML = `
+          <h2>${escapeHtml(selectedNode.label)}</h2>
+          <p>${escapeHtml(selectedNode.explanation || 'Candidate node')}</p>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Symbol</div><div class="metric-value">${escapeHtml(selectedNode.symbol || '')}</div></div>
+            <div class="metric"><div class="metric-label">Rank</div><div class="metric-value">${selectedNode.rank || 'n/a'}</div></div>
+            <div class="metric"><div class="metric-label">Peer Gap</div><div class="metric-value">${selectedNode.gap_ratio ? `${selectedNode.gap_ratio.toFixed(1)}x` : 'n/a'}</div></div>
+            <div class="metric"><div class="metric-label">Market Cap</div><div class="metric-value">${formatCurrency(selectedNode.market_cap)}</div></div>
+          </div>
+          <div class="pill-row">${(selectedNode.bundle_labels || []).map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('')}</div>
+          <div class="pill-row">${(selectedNode.matched_features || []).map((feature) => `<span class="pill">${escapeHtml(feature)}</span>`).join('')}</div>
+          <h3 style="margin-top:18px;">Anchor Peers</h3>
+          <ul>${(selectedNode.peer_assets || []).map((peer) => `<li>${escapeHtml(peer.name)} • ${formatCompact(peer.market_cap)}</li>`).join('')}</ul>
+        `;
+        return;
+      }
+
+      if (selectedNode.type === 'eligible_asset') {
+        detail.innerHTML = `
+          <h2>${escapeHtml(selectedNode.label)}</h2>
+          <p>Eligible asset node. This coin passed the screener filters for at least one bundle, but it is not currently surfaced as a candidate or used as an anchor peer in the focused view.</p>
+          <div class="metric-grid">
+            <div class="metric"><div class="metric-label">Symbol</div><div class="metric-value">${escapeHtml(selectedNode.symbol || '')}</div></div>
+            <div class="metric"><div class="metric-label">Market Cap</div><div class="metric-value">${formatCurrency(selectedNode.market_cap)}</div></div>
+            <div class="metric"><div class="metric-label">Bundles</div><div class="metric-value">${(selectedNode.bundle_labels || []).length}</div></div>
+            <div class="metric"><div class="metric-label">Node Type</div><div class="metric-value">Eligible Asset</div></div>
+          </div>
+          <div class="pill-row">${(selectedNode.bundle_labels || []).map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('')}</div>
+        `;
+        return;
+      }
+
+      detail.innerHTML = `
+        <h2>${escapeHtml(selectedNode.label)}</h2>
+        <p>Anchor peer node. These are the larger reference assets that justify a candidate’s placement inside the same bundle.</p>
+        <div class="metric-grid">
+          <div class="metric"><div class="metric-label">Symbol</div><div class="metric-value">${escapeHtml(selectedNode.symbol || '')}</div></div>
+          <div class="metric"><div class="metric-label">Market Cap</div><div class="metric-value">${formatCurrency(selectedNode.market_cap)}</div></div>
+          <div class="metric"><div class="metric-label">Bundles</div><div class="metric-value">${(selectedNode.bundle_labels || []).length}</div></div>
+          <div class="metric"><div class="metric-label">Referenced By</div><div class="metric-value">${(selectedNode.related_candidates || []).length}</div></div>
+        </div>
+        <div class="pill-row">${(selectedNode.bundle_labels || []).map((label) => `<span class="pill">${escapeHtml(label)}</span>`).join('')}</div>
+        <h3 style="margin-top:18px;">Connected Candidates</h3>
+        <ul>${(selectedNode.related_candidates || []).map((item) => `<li>${escapeHtml(item.name)} • ${escapeHtml(item.bundle_label)}</li>`).join('')}</ul>
       `;
-    }}
+    }
 
-    function renderCards(candidates) {{
-      document.getElementById('candidateCards').innerHTML = candidates.slice(0, 6).map((candidate) => `
-        <article class=\"panel candidate-card\">
-          <h3>${{escapeHtml(candidate.name)}}</h3>
-          <div class=\"gap\">${{candidate.gap_ratio.toFixed(1)}}x peer gap</div>
-          <p>${{escapeHtml(candidate.explanation)}}</p>
-          <div class=\"feature-list\">${{candidate.matched_features.map((feature) => `<span class=\"feature\">${{escapeHtml(feature)}}</span>`).join('')}}</div>
-          <div class=\"peer-list\">${{candidate.peer_assets.map((peer) => `<span class=\"peer\">${{escapeHtml(peer.name)}} • ${{formatCompact(peer.market_cap)}}</span>`).join('')}}</div>
-        </article>
-      `).join('');
-    }}
-
-    function render() {{
+    function draw() {
       renderStats();
-      renderBundleList();
-      const bundle = getBundle(state.selectedBundle);
-      if (!bundle) return;
-      const candidates = getVisibleCandidates(bundle);
-      renderBundleHeader(bundle, candidates);
-      renderTable(candidates);
-      renderCards(candidates);
-    }}
+      resizeCanvas();
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      ctx.clearRect(0, 0, width, height);
 
-    document.getElementById('sortBy').value = state.sortBy;
-    document.getElementById('minVolume').value = state.minVolume;
-    document.getElementById('minAge').value = state.minAge;
-    document.getElementById('capBand').value = state.capBand;
+      const visibleNodes = getVisibleNodes();
+      ensureSelection(visibleNodes);
+      const visibleIds = new Set(visibleNodes.map((node) => node.id));
+      const visibleEdges = getVisibleEdges(visibleIds);
+      projectedNodes = visibleNodes.map((node) => transformNode(node, width, height));
+      const projectedMap = new Map(projectedNodes.map((node) => [node.id, node]));
 
-    document.getElementById('sortBy').addEventListener('change', (event) => {{ state.sortBy = event.target.value; render(); }});
-    document.getElementById('minVolume').addEventListener('input', (event) => {{ state.minVolume = Number(event.target.value || 0); render(); }});
-    document.getElementById('minAge').addEventListener('input', (event) => {{ state.minAge = Number(event.target.value || 0); render(); }});
-    document.getElementById('capBand').addEventListener('change', (event) => {{ state.capBand = event.target.value; render(); }});
+      const edgeAlpha = state.nodeScope === 'focused' ? 0.2 : 0.16;
+      visibleEdges
+        .map((edge) => ({ edge, from: projectedMap.get(edge.source), to: projectedMap.get(edge.target) }))
+        .filter((item) => item.from && item.to)
+        .sort((left, right) => ((left.from.depth + left.to.depth) / 2) - ((right.from.depth + right.to.depth) / 2))
+        .forEach(({ edge, from, to }) => {
+          ctx.save();
+          ctx.globalAlpha = edgeAlpha;
+          ctx.lineWidth = edge.type === 'bundle_membership' ? 1.4 : 1;
+          ctx.strokeStyle = edge.color;
+          ctx.beginPath();
+          ctx.moveTo(from.screenX, from.screenY);
+          ctx.lineTo(to.screenX, to.screenY);
+          ctx.stroke();
+          ctx.restore();
+        });
 
-    render();
+      projectedNodes
+        .slice()
+        .sort((left, right) => left.depth - right.depth)
+        .forEach((node) => {
+          ctx.save();
+          ctx.beginPath();
+          ctx.fillStyle = node.color || '#61f0d1';
+          ctx.shadowBlur = node.type === 'bundle' ? 18 : 12;
+          ctx.shadowColor = node.color || '#61f0d1';
+          ctx.arc(node.screenX, node.screenY, node.radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          if (node.id === state.selectedId) {
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(node.screenX, node.screenY, node.radius + 5, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          if (node.type === 'bundle') {
+            ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(node.screenX, node.screenY, node.radius + 8, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+          if (shouldLabel(node)) {
+            ctx.font = node.type === 'bundle' ? '600 14px Avenir Next' : '500 12px Avenir Next';
+            ctx.fillStyle = '#eef5ff';
+            ctx.fillText(node.label, node.screenX + node.radius + 8, node.screenY - 6);
+          }
+          ctx.restore();
+        });
+
+      document.getElementById('hudSummary').textContent = `${visibleNodes.length} visible nodes • ${visibleEdges.length} visible edges`;
+      renderLegend();
+      renderDetail(projectedNodes.find((node) => node.id === state.selectedId) || null);
+    }
+
+    function pickNode(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      let best = null;
+      let bestDistance = Infinity;
+      projectedNodes.forEach((node) => {
+        const dx = node.screenX - x;
+        const dy = node.screenY - y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance <= node.radius + 8 && distance < bestDistance) {
+          bestDistance = distance;
+          best = node;
+        }
+      });
+      return best;
+    }
+
+    canvas.addEventListener('pointerdown', (event) => {
+      isDragging = true;
+      dragMoved = false;
+      lastPointer = { x: event.clientX, y: event.clientY };
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener('pointermove', (event) => {
+      if (!isDragging || !lastPointer) return;
+      const dx = event.clientX - lastPointer.x;
+      const dy = event.clientY - lastPointer.y;
+      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) dragMoved = true;
+      state.rotY += dx * 0.005;
+      state.rotX = Math.max(-1.1, Math.min(1.1, state.rotX + dy * 0.004));
+      lastPointer = { x: event.clientX, y: event.clientY };
+      draw();
+    });
+
+    canvas.addEventListener('pointerup', (event) => {
+      if (!dragMoved) {
+        const picked = pickNode(event.clientX, event.clientY);
+        if (picked) {
+          state.selectedId = picked.id;
+          draw();
+        }
+      }
+      isDragging = false;
+      lastPointer = null;
+      canvas.releasePointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      state.zoom = Math.max(0.55, Math.min(2.1, state.zoom + Math.sign(event.deltaY) * 0.08));
+      draw();
+    }, { passive: false });
+
+    document.getElementById('bundleFilter').addEventListener('change', (event) => {
+      state.selectedBundle = event.target.value;
+      draw();
+    });
+    document.getElementById('nodeScope').addEventListener('change', (event) => {
+      state.nodeScope = event.target.value;
+      draw();
+    });
+    document.getElementById('labelDensity').addEventListener('change', (event) => {
+      state.labelDensity = event.target.value;
+      draw();
+    });
+    document.getElementById('resetView').addEventListener('click', () => {
+      state.zoom = 1.08;
+      state.rotX = -0.42;
+      state.rotY = 0.56;
+      draw();
+    });
+
+    window.addEventListener('resize', draw);
+
+    renderStats();
+    renderBundleFilter();
+    draw();
   </script>
 </body>
 </html>
 """
+    return html.replace("__PAYLOAD_JSON__", payload_json)
 
 
 def save_processed_outputs(

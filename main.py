@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     fetch_parser = subparsers.add_parser("fetch", help="Pull fresh raw market and metadata from CoinGecko")
-    fetch_parser.add_argument("--pages", type=int, default=3, help="How many 250-asset market pages to fetch")
+    fetch_parser.add_argument("--pages", type=int, default=6, help="How many 250-asset market pages to fetch")
     fetch_parser.add_argument("--sleep-seconds", type=float, default=1.2, help="Delay between CoinGecko requests")
     fetch_parser.add_argument("--output", type=Path, default=RAW_OUTPUT_PATH, help="Where to save the raw CSV")
 
@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_parser.add_argument("--min-gap-ratio", type=float, default=FilterConfig.min_gap_ratio, help="Minimum peer gap ratio to surface")
 
     refresh_parser = subparsers.add_parser("refresh", help="Fetch fresh data and rebuild the screener outputs")
-    refresh_parser.add_argument("--pages", type=int, default=3, help="How many 250-asset market pages to fetch")
+    refresh_parser.add_argument("--pages", type=int, default=6, help="How many 250-asset market pages to fetch")
     refresh_parser.add_argument("--sleep-seconds", type=float, default=1.2, help="Delay between CoinGecko requests")
     refresh_parser.add_argument("--raw-output", type=Path, default=RAW_OUTPUT_PATH, help="Where to save the raw CSV")
     refresh_parser.add_argument("--json-output", type=Path, default=PROCESSED_OUTPUT_PATH, help="Path for processed JSON")
